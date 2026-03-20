@@ -1,0 +1,20 @@
+FROM apache/airflow:2.9.0
+
+USER root
+
+# Instalar OpenJDK-17 y herramientas necesarias, incluido wget
+RUN apt-get update && \
+    apt-get install -y openjdk-17-jdk ant procps wget && \
+    apt-get clean
+
+# Configurar JAVA_HOME
+ENV JAVA_HOME /usr/lib/jvm/java-17-openjdk-amd64/
+
+USER airflow
+
+# Copiar el archivo requirements.txt
+COPY requirements.txt /tmp/requirements.txt
+
+# Instalar paquetes desde el archivo requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+

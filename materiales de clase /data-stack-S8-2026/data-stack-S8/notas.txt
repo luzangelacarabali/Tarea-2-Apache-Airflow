@@ -1,0 +1,8 @@
+docker-compose build --no-cache
+docker-compose up -d
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 
+Oajimenez1!
+
+
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' minio_docker_fhbd_2026
+172.24.0.3

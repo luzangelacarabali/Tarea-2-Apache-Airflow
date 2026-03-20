@@ -1,0 +1,517 @@
+# ============================================================
+# docker-compose.yaml — UNIFICADO
+# Tarea 2 FHBD — Pipeline Spark + Iceberg orquestado con Airflow
+#
+# Servicios incluidos:
+#   Capa de Orquestación : airflow-webserver, scheduler, worker,
+#                          triggerer, init, redis, postgres
+#   Capa de Procesamiento: spark-master, spark-worker
+#   Capa de Almacenamiento: minio (S3), nessie (catalog Iceberg)
+#   Capa de Consulta     : clickhouse
+#   Capa de Desarrollo   : jupyter
+#
+# Uso:
+#   docker compose up -d                  → levantar todo
+#   docker compose --profile flower up -d → incluir Flower UI
+#   docker compose --profile debug up -d  → incluir CLI de Airflow
+#
+# Puertos expuestos:
+#   8080  → Airflow Webserver
+#   8081  → Spark Master UI
+#   8082  → Spark Worker UI
+#   8123  → ClickHouse HTTP
+#   8888  → Jupyter Notebook
+#   9000  → MinIO S3 API
+#   9001  → MinIO Console
+#   9002  → ClickHouse Native (mapeado)
+#   19120 → Nessie API
+#   5555  → Flower (perfil opcional)
+# ============================================================
+
+---
+
+# ============================================================
+# ANCLA COMÚN — Configuración compartida de todos los
+# servicios de Airflow (webserver, scheduler, worker, etc.)
+# ============================================================
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  image: fhbd-airflow:2.10.3
+  environment:
+    &airflow-common-env
+    # --- Core Airflow ---
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+
+    # --- Conexión Spark (usada por SparkSubmitOperator) ---
+    AIRFLOW_CONN_SPARK_DEFAULT: 'spark://spark-master:7077'
+    SPARK_HOME: '/opt/spark'
+
+    # --- Credenciales MinIO (para pasarlas a los jobs de Spark) ---
+    MINIO_ENDPOINT: 'http://fhbd-minio:9000'
+    MINIO_ACCESS_KEY: '${MINIO_ACCESS_KEY:-minioadmin}'
+    MINIO_SECRET_KEY: '${MINIO_SECRET_KEY:-minioadmin123}'
+    MINIO_BUCKET_RAW: 'raw'
+    MINIO_BUCKET_ICEBERG: 'iceberg'
+
+    # --- Nessie ---
+    NESSIE_URL: 'http://fhbd-nessie:19120/iceberg'
+    NESSIE_BRANCH: 'main'
+
+    # --- Iceberg ---
+    ICEBERG_NAMESPACE: 'nyc'
+    ICEBERG_TABLE: 'yellow_tripdata'
+
+    # --- Datos de entrada ---
+    PARQUET_URL: 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2025-01.parquet'
+
+    # --- PIP adicional (solo para pruebas rápidas) ---
+    _PIP_ADDITIONAL_REQUIREMENTS: '${_PIP_ADDITIONAL_REQUIREMENTS:-}'
+
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/airflow/data
+    - ${AIRFLOW_PROJ_DIR:-.}/scripts:/opt/airflow/scripts   # Scripts Spark accesibles desde workers
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+  networks:
+    - fhbd-network
+
+
+# ============================================================
+# SERVICIOS
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # INFRAESTRUCTURA DE AIRFLOW
+  # ----------------------------------------------------------
+
+  postgres:
+    image: postgres:13
+    container_name: fhbd-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - fhbd-network
+
+  redis:
+    image: redis:7.2-bookworm
+    container_name: fhbd-redis
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    networks:
+      - fhbd-network
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: fhbd-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo -e "\033[1;33mWARNING: AIRFLOW_UID not set!\e[0m"
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        disk_available=$$(df / | tail -1 | awk '{print $$4}')
+        warning_resources="false"
+        if (( mem_available < 4000 )); then
+          echo -e "\033[1;33mWARNING: At least 4GB RAM required.\e[0m"
+          warning_resources="true"
+        fi
+        if (( cpus_available < 2 )); then
+          echo -e "\033[1;33mWARNING: At least 2 CPUs recommended.\e[0m"
+          warning_resources="true"
+        fi
+        if (( disk_available < one_meg * 10 )); then
+          echo -e "\033[1;33mWARNING: At least 10GB disk required.\e[0m"
+          warning_resources="true"
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/scripts /sources/data
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,scripts,data}
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: '${_AIRFLOW_WWW_USER_USERNAME:-airflow}'
+      _AIRFLOW_WWW_USER_PASSWORD: '${_AIRFLOW_WWW_USER_PASSWORD:-airflow}'
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: fhbd-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+      nessie:
+        condition: service_started
+      spark-master:
+        condition: service_started
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: fhbd-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    container_name: fhbd-airflow-worker
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: fhbd-airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Herramienta CLI de Airflow (solo con perfil debug)
+  airflow-cli:
+    <<: *airflow-common
+    container_name: fhbd-airflow-cli
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+
+  # Flower: UI de monitoreo de workers Celery (perfil opcional)
+  flower:
+    <<: *airflow-common
+    container_name: fhbd-flower
+    command: celery flower
+    profiles:
+      - flower
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+
+  # ----------------------------------------------------------
+  # PROCESAMIENTO — Apache Spark
+  # ----------------------------------------------------------
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: fhbd-spark:3.5.3
+    container_name: fhbd-spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8081
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      # Credenciales MinIO para jobs de Spark
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY:-minioadmin123}
+      - AWS_REGION=us-east-1
+    ports:
+      - "7077:7077"   # Spark submit port
+      - "8081:8081"   # Spark Master Web UI
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/scripts:/opt/spark/scripts   # Scripts del pipeline
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/spark/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8081"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: always
+    networks:
+      - fhbd-network
+    depends_on:
+      - minio
+      - nessie
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: fhbd-spark:3.5.3
+    container_name: fhbd-spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8082
+    environment:
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY:-minioadmin123}
+      - AWS_REGION=us-east-1
+    ports:
+      - "8082:8082"   # Spark Worker Web UI
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/scripts:/opt/spark/scripts
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/opt/spark/data
+    restart: always
+    networks:
+      - fhbd-network
+    depends_on:
+      - spark-master
+
+
+  # ----------------------------------------------------------
+  # ALMACENAMIENTO — MinIO (S3-compatible)
+  # ----------------------------------------------------------
+
+  minio:
+    image: minio/minio:latest
+    container_name: fhbd-minio
+    ports:
+      - "9000:9000"   # S3 API — usado por Spark, Nessie, Airflow
+      - "9001:9001"   # MinIO Console Web UI
+    environment:
+      MINIO_ROOT_USER: '${MINIO_ACCESS_KEY:-minioadmin}'
+      MINIO_ROOT_PASSWORD: '${MINIO_SECRET_KEY:-minioadmin123}'
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: always
+    networks:
+      - fhbd-network
+
+
+  # ----------------------------------------------------------
+  # CATÁLOGO — Nessie (Iceberg catalog con Git-like versioning)
+  # ----------------------------------------------------------
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+    container_name: fhbd-nessie
+    user: root
+    ports:
+      - "19120:19120"
+    env_file:
+      - ./.env
+    environment:
+      - NESSIE_SERVER_AUTHENTICATION_ENABLED=false
+      - QUARKUS_HTTP_PORT=19120
+      - NESSIE_VERSION_STORE_TYPE=IN_MEMORY
+      - NESSIE_CATALOG_DEFAULT_WAREHOUSE=warehouse
+      - NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION=s3://iceberg
+      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION=us-east-1
+      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT=http://fhbd-minio:9000
+      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS=true
+      - NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_AUTH_TYPE=application-global
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY:-minioadmin123}
+      - AWS_REGION=us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:19120/api/v2/config"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: always
+    networks:
+      - fhbd-network
+    depends_on:
+      minio:
+        condition: service_healthy
+
+
+  # ----------------------------------------------------------
+  # CONSULTA — ClickHouse
+  # ----------------------------------------------------------
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: fhbd-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9002:9000"   # Native protocol (mapeado para no chocar con MinIO:9000)
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: always
+    networks:
+      - fhbd-network
+
+
+  # ----------------------------------------------------------
+  # DESARROLLO — Jupyter Notebook
+  # ----------------------------------------------------------
+
+  jupyter:
+    image: jupyter/base-notebook:latest
+    container_name: fhbd-jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_TOKEN=fhbd
+
+      # MinIO
+      - MINIO_ENDPOINT=http://fhbd-minio:9000
+      - MINIO_BUCKET_RAW=raw
+      - MINIO_BUCKET_ICEBERG=iceberg
+      - MINIO_OBJECT_KEY=nyc/yellow_tripdata_2025-01.parquet
+      - PARQUET_URL=https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2025-01.parquet
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin123}
+
+      # Nessie
+      - NESSIE_URL=http://fhbd-nessie:19120/iceberg
+      - NESSIE_BRANCH=main
+
+      # Iceberg
+      - ICEBERG_NAMESPACE=nyc
+      - ICEBERG_TABLE=yellow_tripdata
+
+      # Spark master
+      - SPARK_MASTER=spark://spark-master:7077
+
+    volumes:
+      - ./scripts:/home/jovyan/scripts
+      - ./notebooks:/home/jovyan/notebooks
+      - ./data:/home/jovyan/data
+      - ./requirements.txt:/home/jovyan/requirements.txt:ro
+      - ./.env:/home/jovyan/.env
+    depends_on:
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    command: >
+      bash -lc "pip install -r /home/jovyan/requirements.txt &&
+      start-notebook.py --NotebookApp.token=$${JUPYTER_TOKEN}"
+    restart: always
+    networks:
+      - fhbd-network
+
+
+# ============================================================
+# VOLÚMENES — Persistencia de datos
+# ============================================================
+volumes:
+  postgres-db-volume:      # Metadata de Airflow
+  minio_data:              # Datos del Data Lake (raw + iceberg)
+  nessie_data:             # Metadatos del catálogo Nessie
+  clickhouse_data:         # Datos de ClickHouse
+
+
+# ============================================================
+# RED — Todos los servicios comparten esta red para
+# comunicarse por nombre de contenedor (fhbd-minio, etc.)
+# ============================================================
+networks:
+  fhbd-network:
+    driver: bridge
+    name: fhbd-network
